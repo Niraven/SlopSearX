@@ -6,6 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 
 from slopsearx.config import (
@@ -63,6 +64,8 @@ class TestLoadConfig:
         config = load_config()
         assert "brave" in config.engines
         assert config.engines["brave"].base_url == "https://api.search.brave.com/res/v1/web/search"
+        assert config.engines["arxiv"].base_url == "https://export.arxiv.org/api/query"
+        assert config.engines["github"].rate_limit == 0.15
         assert config.cache.ttl_seconds == 300
 
     def test_config_file_overrides_defaults(self) -> None:
@@ -160,3 +163,11 @@ class TestLoadConfig:
             assert config.engines["brave"].api_key == "super-secret-key"
         finally:
             del os.environ["ENGINE_BRAVE_API_KEY"]
+
+    def test_github_token_alias_maps_to_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ENGINE_GITHUB_API_KEY", raising=False)
+        monkeypatch.setenv("ENGINE_GITHUB_TOKEN", "github-test-token")
+
+        config = load_config()
+
+        assert config.engines["github"].api_key == "github-test-token"

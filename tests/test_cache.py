@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from slopsearx.cache import SearchCache, _answer_cache_key, _ttl_for_query, cache_key, normalize_query
+from slopsearx.cache import SearchCache, _ttl_for_query, cache_key, normalize_query
 
 
 class TestNormalizeQuery:
@@ -80,29 +80,48 @@ class TestCacheKey:
         k2 = cache_key("python programming", "en", 0)
         assert k1 == k2
 
+    def test_route_scope_is_part_of_key(self) -> None:
+        general = cache_key("same query", "en", 0)
+        science = cache_key("same query", "en", 0, categories=["science"], engines=["openalex"])
+        github = cache_key("same query", "en", 0, categories=["github:code"], engines=["github"])
 
-class TestAnswerCacheKey:
-    """Answer-level cache key construction."""
+        assert len({general, science, github}) == 3
 
-    def test_prefix(self) -> None:
-        key = _answer_cache_key("test query")
-        assert key.startswith("answer:")
+    def test_route_lists_are_order_insensitive(self) -> None:
+        first = cache_key(
+            "same query",
+            "en",
+            0,
+            categories=["science", "reference"],
+            engines=["wikipedia", "openalex"],
+        )
+        second = cache_key(
+            "same query",
+            "en",
+            0,
+            categories=["reference", "science"],
+            engines=["openalex", "wikipedia"],
+        )
 
-    def test_normalized(self) -> None:
-        k1 = _answer_cache_key("Hello World!")
-        k2 = _answer_cache_key("hello world")
-        assert k1 == k2
+        assert first == second
 
-    def test_no_language_dependence(self) -> None:
-        """Answer key only depends on query, not language."""
-        q = "test query"
-        # Compare with cache_key to show different structure
-        k = _answer_cache_key(q)
-        assert k.startswith("answer:")
-        assert "|" not in k  # no language/safesearch
+    @pytest.mark.parametrize(
+        ("overrides", "expected_to_differ"),
+        [
+            ({"pageno": 2}, True),
+            ({"time_range": "month"}, True),
+            ({"response_format": "yaml"}, True),
+        ],
+    )
+    def test_wire_and_pagination_scope_is_part_of_key(
+        self,
+        overrides: dict[str, object],
+        expected_to_differ: bool,
+    ) -> None:
+        baseline = cache_key("same query", "en", 0)
+        scoped = cache_key("same query", "en", 0, **overrides)
 
-    def test_different_queries_different_keys(self) -> None:
-        assert _answer_cache_key("python") != _answer_cache_key("rust")
+        assert (baseline != scoped) is expected_to_differ
 
 
 class TestTTL:
@@ -177,20 +196,6 @@ class TestNegativeCacheDisconnected:
         # No exception is success
 
 
-class TestAnswerCacheDisconnected:
-    """Answer caching graceful degradation."""
-
-    async def test_get_answer_noop_when_disconnected(self) -> None:
-        cache = SearchCache(valkey_url="")
-        result = await cache.get_answer("test query")
-        assert result is None
-
-    async def test_set_answer_noop_when_disconnected(self) -> None:
-        cache = SearchCache(valkey_url="")
-        await cache.set_answer("test query", {"data": "test"})
-        # No exception is success
-
-
 class TestCacheAsyncConformance:
     """M3-006: All I/O methods are async def."""
 
@@ -212,12 +217,6 @@ class TestCacheAsyncConformance:
     def test_set_error_is_async(self) -> None:
         assert inspect.iscoroutinefunction(SearchCache.set_error)
 
-    def test_get_answer_is_async(self) -> None:
-        assert inspect.iscoroutinefunction(SearchCache.get_answer)
-
-    def test_set_answer_is_async(self) -> None:
-        assert inspect.iscoroutinefunction(SearchCache.set_answer)
-
 
 class TestSearchCacheDefaults:
     """Default TTL values from env or hardcoded defaults."""
@@ -226,7 +225,6 @@ class TestSearchCacheDefaults:
         cache = SearchCache(valkey_url="")
         assert cache._default_ttl == 3600
         assert cache._negative_ttl == 60
-        assert cache._answer_ttl == 3600
 
     def test_env_var_ttl_overrides(self, monkeypatch: "pytest.MonkeyPatch") -> None:
         monkeypatch.setenv("SEARCH_CACHE_TTL_SECONDS", "7200")
@@ -234,7 +232,6 @@ class TestSearchCacheDefaults:
         cache = SearchCache(valkey_url="")
         assert cache._default_ttl == 7200
         assert cache._negative_ttl == 120
-        assert cache._answer_ttl == 7200
 
 
 class TestSearchCacheMocked:
@@ -271,48 +268,9 @@ class TestSearchCacheMocked:
         args = mock_client.setex.call_args
         assert args[0][1] == 30
 
-    async def test_get_answer_uses_answer_prefix(self) -> None:
-        mock_client, cache = self._make_mocks()
-        mock_client.get.return_value = None
-        result = await cache.get_answer("test query")
-        assert result is None
-        # Should look up answer:{sha256}
-        key = mock_client.get.call_args[0][0]
-        assert key.startswith("answer:")
-        assert len(key) > len("answer:")  # has digest suffix
-
-    async def test_set_answer_uses_answer_prefix_and_default_ttl(self) -> None:
-        mock_client, cache = self._make_mocks()
-        await cache.set_answer("test query", {"data": "test"})
-        mock_client.setex.assert_called_once()
-        args = mock_client.setex.call_args
-        key = args[0][0]
-        assert key.startswith("answer:")
-        assert args[0][1] == 3600  # default _answer_ttl
-
-    async def test_set_answer_custom_ttl(self) -> None:
-        mock_client, cache = self._make_mocks()
-        await cache.set_answer("test query", {"data": "test"}, ttl=300)
-        args = mock_client.setex.call_args
-        assert args[0][1] == 300
-
     async def test_set_error_client_exception_logged(self) -> None:
         """set_error does not propagate Valkey exceptions."""
         mock_client, cache = self._make_mocks()
         mock_client.setex.side_effect = RuntimeError("Valkey error")
         await cache.set_error("some_key")
-        # No exception is success
-
-    async def test_get_answer_client_exception_returns_none(self) -> None:
-        """get_answer does not propagate Valkey exceptions."""
-        mock_client, cache = self._make_mocks()
-        mock_client.get.side_effect = RuntimeError("Valkey error")
-        result = await cache.get_answer("test query")
-        assert result is None
-
-    async def test_set_answer_client_exception_logged(self) -> None:
-        """set_answer does not propagate Valkey exceptions."""
-        mock_client, cache = self._make_mocks()
-        mock_client.setex.side_effect = RuntimeError("Valkey error")
-        await cache.set_answer("test query", {"data": "test"})
         # No exception is success

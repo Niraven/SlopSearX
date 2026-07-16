@@ -58,6 +58,13 @@ class _MockEngine(EngineAdapter):
                 status=EngineStatus.RATE_LIMITED,
                 error_message="too many requests",
             )
+        if query == "precondition":
+            return AdapterResponse(
+                results=[],
+                status=EngineStatus.ERROR,
+                error_message="missing route-specific credential",
+                circuit_breaker_failure=False,
+            )
         if query == "leak_exception":
             # Raise an exception with an embedded URL to test server-level sanitization
             raise RuntimeError(
@@ -89,6 +96,56 @@ class _EmptyScrapeEngine(EngineAdapter):
 
     async def search(self, query, params=None):
         return AdapterResponse(results=[], status=EngineStatus.OK)
+
+
+class _RouteEngine(EngineAdapter):
+    """Engine double whose label proves which effective route dispatched."""
+
+    name = "route"
+    categories = ["general"]
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.label = label
+        self.calls = 0
+        self.last_categories: list[str] = []
+
+    async def search(self, query, params=None):
+        self.calls += 1
+        self.last_categories = list((params or {}).get("categories", []))
+        return AdapterResponse(
+            results=[
+                SearchResult(
+                    url=f"https://example.com/{self.label}",
+                    title=self.label,
+                    content=self.label,
+                    engine=self.label,
+                )
+            ],
+            status=EngineStatus.OK,
+        )
+
+
+class _MemoryCache:
+    """Small in-memory cache double for route-isolation tests."""
+
+    is_connected = True
+
+    def __init__(self) -> None:
+        self.search: dict[str, dict] = {}
+        self.answers: dict[str, dict] = {}
+
+    async def get(self, key: str):
+        return self.search.get(key)
+
+    async def set(self, key: str, value: dict, _ttl: int):
+        self.search[key] = value
+
+    async def get_answer(self, query: str):
+        raise AssertionError("query-only answer cache must not be read")
+
+    async def set_answer(self, query: str, value: dict):
+        raise AssertionError("query-only answer cache must not be written")
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +294,131 @@ class TestSearchEndpoint:
         assert "text/vnd.yaml+markdown" in response.headers["content-type"]
         assert "test" in response.text
         assert "## Results Summary" in response.text
+
+    def test_format_is_canonicalized_before_cache_lookup(self, client: TestClient, monkeypatch) -> None:
+        import slopsearx.server as server_mod
+
+        monkeypatch.setattr(server_mod, "_cache", _MemoryCache())
+
+        uppercase = client.get("/search", params={"q": "same format query", "format": "YAML"})
+        lowercase = client.get("/search", params={"q": "same format query", "format": "yaml"})
+
+        assert uppercase.status_code == 200
+        assert lowercase.status_code == 200
+        assert "text/vnd.yaml+markdown" in uppercase.headers["content-type"]
+        assert "text/vnd.yaml+markdown" in lowercase.headers["content-type"]
+
+    def test_unknown_format_is_rejected(self, client: TestClient) -> None:
+        response = client.get("/search", params={"q": "test", "format": "html"})
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_format"
+
+    def test_cached_json_never_leaks_into_yaml_response(self, client: TestClient, monkeypatch) -> None:
+        import slopsearx.server as server_mod
+
+        monkeypatch.setattr(server_mod, "_cache", _MemoryCache())
+
+        json_response = client.get("/search", params={"q": "same cached query"})
+        yaml_response = client.get("/search", params={"q": "same cached query", "format": "yaml"})
+
+        assert json_response.status_code == 200
+        assert "text/vnd.yaml+markdown" in yaml_response.headers["content-type"]
+
+    def test_cache_isolated_by_category(self, client: TestClient, monkeypatch) -> None:
+        import slopsearx.server as server_mod
+
+        cache = _MemoryCache()
+        monkeypatch.setattr(server_mod, "_cache", cache)
+
+        science = client.get("/search", params={"q": "same scoped query", "categories": "science"})
+        news = client.get("/search", params={"q": "same scoped query", "categories": "news"})
+
+        assert science.status_code == 200
+        assert news.status_code == 200
+        assert science.json()["meta"]["cached"] is False
+        assert news.json()["meta"]["cached"] is False
+        assert len(cache.search) == 2
+        assert cache.answers == {}
+
+    def test_cache_isolated_when_effective_engine_route_changes(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ) -> None:
+        import slopsearx.server as server_mod
+
+        cache = _MemoryCache()
+        first_engine = _RouteEngine("first")
+        second_engine = _RouteEngine("second")
+        monkeypatch.setattr(server_mod, "_cache", cache)
+
+        server_mod._active_engines = {"first": first_engine}
+        first = client.get("/search", params={"q": "same route query"})
+        server_mod._active_engines = {"second": second_engine}
+        second = client.get("/search", params={"q": "same route query"})
+
+        assert first.json()["results"][0]["title"] == "first"
+        assert second.json()["results"][0]["title"] == "second"
+        assert first_engine.calls == 1
+        assert second_engine.calls == 1
+        assert len(cache.search) == 2
+
+    def test_categories_are_canonicalized_before_dispatch(self, client: TestClient) -> None:
+        import slopsearx.server as server_mod
+
+        engine = _RouteEngine("category")
+        server_mod._active_engines = {"route": engine}
+
+        response = client.get(
+            "/search",
+            params={"q": "category query", "categories": " Science,REFERENCE ", "engines": "route"},
+        )
+
+        assert response.status_code == 200
+        assert engine.last_categories == ["science", "reference"]
+
+    def test_blocked_engine_eventually_opens_circuit(self, client: TestClient) -> None:
+        import slopsearx.server as server_mod
+
+        engine = _MockEngine()
+        engine._circuit_threshold = 1
+        server_mod._active_engines = {"mocktest": engine}
+
+        blocked = client.get("/search", params={"q": "blocked"})
+        after_block = client.get("/search", params={"q": "fresh query"})
+
+        assert blocked.status_code == 503
+        assert after_block.status_code == 503
+        assert after_block.json()["unresponsive_engines"] == [["mocktest", "circuit open"]]
+
+    def test_rate_limit_does_not_open_shared_circuit(self, client: TestClient) -> None:
+        import slopsearx.server as server_mod
+
+        engine = _MockEngine()
+        engine._circuit_threshold = 1
+        server_mod._active_engines = {"mocktest": engine}
+
+        limited = client.get("/search", params={"q": "rate_limited"})
+        unrelated = client.get("/search", params={"q": "fresh query"})
+
+        assert limited.status_code == 503
+        assert unrelated.status_code == 200
+        assert engine.circuit_allowed()
+
+    def test_route_precondition_error_does_not_open_shared_circuit(self, client: TestClient) -> None:
+        import slopsearx.server as server_mod
+
+        engine = _MockEngine()
+        engine._circuit_threshold = 1
+        server_mod._active_engines = {"mocktest": engine}
+
+        precondition = client.get("/search", params={"q": "precondition"})
+        unrelated = client.get("/search", params={"q": "fresh query"})
+
+        assert precondition.status_code == 503
+        assert unrelated.status_code == 200
+        assert engine.circuit_allowed()
 
     def test_json_format_default(self, client: TestClient) -> None:
         """format=json is the default."""

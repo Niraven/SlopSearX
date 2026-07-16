@@ -81,7 +81,7 @@ class Config:
 
 _DEFAULT_ENGINES: dict[str, dict[str, Any]] = {
     "arxiv": {
-        "base_url": "http://export.arxiv.org/api/query",
+        "base_url": "https://export.arxiv.org/api/query",
         "type": "api",
         "timeout_ms": 10_000,
         "max_results": 5,
@@ -108,7 +108,7 @@ _DEFAULT_ENGINES: dict[str, dict[str, Any]] = {
         "type": "api",
         "timeout_ms": 5_000,
         "max_results": 5,
-        "rate_limit": 0.5,  # 30 req/min with token
+        "rate_limit": 0.15,  # 9 req/min; safe for GitHub search and code-search quotas
         "weight": 0.8,
     },
     "google": {
@@ -313,6 +313,10 @@ def _load_env_overrides() -> dict[str, Any]:
         if key.startswith("SEARCH_"):
             overrides[key.lower()] = value
         elif key.startswith("ENGINE_"):
+            if key == "ENGINE_GITHUB_TOKEN":
+                # Backward-compatible alias; the canonical variable is
+                # ENGINE_GITHUB_API_KEY.
+                continue
             # ENGINE_BRAVE_API_KEY → brave.api_key
             parts = key.split("_", 2)
             if len(parts) < 3:
@@ -320,6 +324,8 @@ def _load_env_overrides() -> dict[str, Any]:
             engine_name = parts[1].lower()
             setting = parts[2].lower()
             overrides[f"engines.{engine_name}.{setting}"] = value
+    if "ENGINE_GITHUB_API_KEY" not in os.environ and (github_token := os.environ.get("ENGINE_GITHUB_TOKEN")):
+        overrides["engines.github.api_key"] = github_token
     return overrides
 
 
