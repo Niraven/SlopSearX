@@ -572,7 +572,11 @@ class TestGitHubAdapter:
         }
 
     async def test_search_repos(self, adapter, repo_response):
-        async with MockHTTP(lambda r: httpx.Response(200, json=repo_response)):
+        def _handler(request):
+            assert request.headers["Authorization"] == "Bearer test-token"
+            return httpx.Response(200, json=repo_response)
+
+        async with MockHTTP(_handler):
             result = await adapter.search("test repo")
         assert result.status == EngineStatus.OK
         assert len(result.results) == 2
@@ -580,18 +584,95 @@ class TestGitHubAdapter:
         assert "★ 42" in result.results[0].content
         assert result.results[0].score == 42.0
 
-    async def test_search_missing_token(self):
+    async def test_public_repository_search_does_not_require_token(self, repo_response):
         instances = discover_engines({"github": {"enabled": True, "api_key": ""}})
         adapter = instances["github"]
-        result = await adapter.search("test")
+
+        def _handler(request):
+            assert request.url.path == "/search/repositories"
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, json=repo_response)
+
+        async with MockHTTP(_handler):
+            result = await adapter.search("test")
+
+        assert result.status == EngineStatus.OK
+        assert len(result.results) == 2
+
+    async def test_code_search_still_requires_token(self):
+        instances = discover_engines({"github": {"enabled": True, "api_key": ""}})
+        adapter = instances["github"]
+
+        result = await adapter.search("test", {"categories": ["github:code"]})
+
         assert result.status == EngineStatus.ERROR
-        assert "token not configured" in (result.error_message or "").lower()
+        assert "engine_github_api_key" in (result.error_message or "").lower()
+        assert result.circuit_breaker_failure is False
+
+    async def test_code_search_category_is_case_insensitive(self):
+        instances = discover_engines({"github": {"enabled": True, "api_key": ""}})
+        adapter = instances["github"]
+
+        result = await adapter.search("test", {"categories": ["GitHub:Code"]})
+
+        assert result.status == EngineStatus.ERROR
+        assert "engine_github_api_key" in (result.error_message or "").lower()
 
     async def test_search_rate_limited(self, adapter):
         async with MockHTTP(lambda r: httpx.Response(403, content=b'{"message":"rate limit exceeded"}')):
             result = await adapter.search("test")
         assert result.status == EngineStatus.RATE_LIMITED
         assert result.results == []
+
+    async def test_search_429_is_rate_limited(self, adapter):
+        async with MockHTTP(lambda r: httpx.Response(429, headers={"Retry-After": "60"})):
+            result = await adapter.search("test")
+
+        assert result.status == EngineStatus.RATE_LIMITED
+
+    async def test_retry_after_extends_provider_cooldown(self, repo_response, monkeypatch):
+        instances = discover_engines({"github": {"enabled": True, "api_key": "", "rate_limit": 0.15}})
+        adapter = instances["github"]
+        now = [100.0]
+        calls = 0
+        monkeypatch.setattr("engines.github.time.monotonic", lambda: now[0])
+
+        def _handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(429, headers={"Retry-After": "60"})
+            return httpx.Response(200, json=repo_response)
+
+        async with MockHTTP(_handler):
+            limited = await adapter.search("first query")
+            now[0] = 107.0
+            before_retry_after = await adapter.search("second query")
+            now[0] = 161.0
+            after_retry_after = await adapter.search("third query")
+
+        assert limited.status == EngineStatus.RATE_LIMITED
+        assert before_retry_after.status == EngineStatus.RATE_LIMITED
+        assert after_retry_after.status == EngineStatus.OK
+        assert calls == 2
+
+    async def test_provider_quota_guard_blocks_second_outbound_request(self, repo_response):
+        instances = discover_engines({"github": {"enabled": True, "api_key": "", "rate_limit": 0.15}})
+        adapter = instances["github"]
+        calls = 0
+
+        def _handler(request):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=repo_response)
+
+        async with MockHTTP(_handler):
+            first = await adapter.search("first query")
+            second = await adapter.search("second query")
+
+        assert first.status == EngineStatus.OK
+        assert second.status == EngineStatus.RATE_LIMITED
+        assert calls == 1
 
     async def test_search_422_graceful(self, adapter):
         async with MockHTTP(lambda r: httpx.Response(422, content=b'{"message":"code search limited"}')):

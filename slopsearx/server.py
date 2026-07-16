@@ -362,10 +362,29 @@ async def search(
     query_id = _generate_query_id()
     t_start = time.monotonic()
 
+    response_format = format.strip().lower()
+    if response_format not in {"json", "yaml"}:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_format",
+                "message": "The 'format' parameter must be 'json' or 'yaml'.",
+            },
+        )
+
+    language = language.strip().lower()
+    time_range = time_range.strip().lower()
+    requested_categories = list(
+        dict.fromkeys(category.strip().lower() for category in categories.split(",") if category.strip())
+    )
+    requested_engines = list(
+        dict.fromkeys(engine.strip().lower() for engine in engines_param.split(",") if engine.strip())
+    )
+
     # Increment request counter
     m.server_requests.inc({})
-    m.server_requests_by_format.inc({"format": _safe_metric_label(format)})
-    for cat in (c.strip() for c in categories.split(",") if c.strip()):
+    m.server_requests_by_format.inc({"format": _safe_metric_label(response_format)})
+    for cat in requested_categories:
         m.server_requests_by_category.inc({"category": _safe_metric_label(cat)})
 
     # Validate query
@@ -379,17 +398,17 @@ async def search(
         )
 
     # Determine which engines to query
-    if engines_param.strip():
+    if requested_engines:
         # Explicit engine list wins over category filter
-        requested = [e.strip() for e in engines_param.split(",") if e.strip()]
-        target_engines = {name: eng for name, eng in _active_engines.items() if name in requested}
+        target_engines = {name: eng for name, eng in _active_engines.items() if name in requested_engines}
     else:
         target_engines = dict(_active_engines)
         # Category filter (only when engines not explicitly specified)
-        cat_list = [c.strip() for c in categories.split(",") if c.strip()]
-        if cat_list:
+        if requested_categories:
             target_engines = {
-                name: eng for name, eng in target_engines.items() if any(c in eng.categories for c in cat_list)
+                name: eng
+                for name, eng in target_engines.items()
+                if any(category in eng.categories for category in requested_categories)
             }
         elif _router is not None:
             # No category filter — try query-based routing
@@ -427,8 +446,18 @@ async def search(
         "safesearch": safesearch,
         "pageno": pageno,
         "time_range": time_range if time_range else None,
-        "categories": [c.strip() for c in categories.split(",") if c.strip()] or ["general"],
+        "categories": requested_categories or ["general"],
     }
+    route_cache_key = cache_key(
+        q,
+        language,
+        safesearch,
+        categories=requested_categories,
+        engines=sorted(target_engines),
+        pageno=pageno,
+        time_range=time_range,
+        response_format=response_format,
+    )
 
     # Per-client rate limiting — checked before semaphore acquisition
     if _client_rate_window is not None:
@@ -446,20 +475,11 @@ async def search(
     # Check search cache first.
     cached_response = await _check_cache(
         _cache,
-        lambda cache: cache.get(cache_key(q, language, safesearch)),
+        lambda cache: cache.get(route_cache_key),
         query_id,
     )
     if cached_response is not None:
         return cached_response
-
-    # Check answer cache (broader key, independent of language/safesearch)
-    answer_cached_response = await _check_cache(
-        _cache,
-        lambda cache: cache.get_answer(q),
-        query_id,
-    )
-    if answer_cached_response is not None:
-        return answer_cached_response
 
     # Dispatch to all engines concurrently (bounded by semaphore)
     tasks = []
@@ -493,10 +513,13 @@ async def search(
 
         # Update circuit breaker state
         engine = target_engines[name]
-        if result.status in (EngineStatus.ERROR, EngineStatus.TIMEOUT):
-            engine.record_failure()
-        else:
+        if result.status == EngineStatus.OK:
             engine.record_success()
+        elif result.circuit_breaker_failure is True or (
+            result.circuit_breaker_failure is None
+            and result.status in (EngineStatus.BLOCKED, EngineStatus.ERROR, EngineStatus.TIMEOUT)
+        ):
+            engine.record_failure()
 
         responses[name] = result
         engine_results[name] = result.results
@@ -566,7 +589,7 @@ async def search(
         if resp.infoboxes:
             all_infoboxes.extend(resp.infoboxes)
 
-    if format == "yaml":
+    if response_format == "yaml":
         engine_count = len(target_engines)
         responsive_count = sum(1 for resp in responses.values() if resp.status == EngineStatus.OK)
         yaml_output = format_yaml_markdown(
@@ -597,12 +620,8 @@ async def search(
     # Cache the result set (even partial results are cacheable)
     if _cache is not None and _cache.is_connected and not all_unresponsive:
         cat_list = search_params.get("categories", [])
-        ck = cache_key(q, language, safesearch)
         ttl = _ttl_for_query(cat_list)
-        await _cache.set(ck, response_data, ttl)
-        # Also cache in answer cache (broader key, skip for time-sensitive queries)
-        if not time_range:
-            await _cache.set_answer(q, response_data)
+        await _cache.set(route_cache_key, response_data, ttl)
 
     # Record audit trail (fire-and-forget)
     if _audit_logger is not None:

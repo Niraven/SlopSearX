@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -24,32 +25,25 @@ class GitHubAdapter(EngineAdapter):
     engine_type = "api"
     categories = ["reference", "github:code", "github:issues", "github:prs"]
 
+    def __init__(self, config: dict[str, Any] | None = None, rate_limiter: Any = None) -> None:
+        super().__init__(config, rate_limiter)
+        self._quota_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+
     async def search(
         self,
         query: str,
         params: dict[str, Any] | None = None,
     ) -> AdapterResponse:
-        if early := await self._check_rate_limit():
-            return early
-
         cfg = self.config
         token = cfg.get("api_key") or ""
         base_url = cfg.get("base_url", "https://api.github.com")
         timeout_ms = cfg.get("timeout_ms", 5_000)
         max_results = cfg.get("max_results", 5)
-        categories = (params or {}).get("categories", []) or ["general"]
-
-        if not token:
-            return AdapterResponse(
-                results=[],
-                status=EngineStatus.ERROR,
-                error_message="GitHub token not configured (set ENGINE_GITHUB_TOKEN)",
-            )
-
-        headers = {
-            "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "SlopSearX/0.1.0",
+        categories = {
+            str(category).strip().lower()
+            for category in ((params or {}).get("categories", []) or ["general"])
+            if str(category).strip()
         }
 
         # Determine sub-mode from categories
@@ -59,6 +53,27 @@ class GitHubAdapter(EngineAdapter):
             endpoint = f"{base_url}/search/issues"
         else:
             endpoint = f"{base_url}/search/repositories"
+
+        if "/search/code" in endpoint and not token:
+            return AdapterResponse(
+                results=[],
+                status=EngineStatus.ERROR,
+                error_message="GitHub code search requires ENGINE_GITHUB_API_KEY",
+                circuit_breaker_failure=False,
+            )
+
+        if early := await self._check_rate_limit():
+            return early
+        if quota_response := await self._check_provider_quota():
+            return quota_response
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "SlopSearX/0.2.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         params_dict: dict[str, Any] = {
             "q": query,
@@ -72,8 +87,26 @@ class GitHubAdapter(EngineAdapter):
                 resp = await client.get(endpoint, headers=headers, params=params_dict)
                 latency = (time.monotonic() - start_time) * 1000
 
-                if resp.status_code == 403 and "rate limit" in (resp.text or "").lower():
-                    return AdapterResponse(results=[], status=EngineStatus.RATE_LIMITED, latency_ms=latency)
+                rate_limit_remaining = resp.headers.get("x-ratelimit-remaining")
+                if resp.status_code == 429 or (
+                    resp.status_code == 403
+                    and ("rate limit" in (resp.text or "").lower() or rate_limit_remaining == "0")
+                ):
+                    await self._extend_provider_cooldown(resp.headers)
+                    return AdapterResponse(
+                        results=[],
+                        status=EngineStatus.RATE_LIMITED,
+                        error_message="rate limited by GitHub",
+                        latency_ms=latency,
+                    )
+                if resp.status_code == 401:
+                    return AdapterResponse(
+                        results=[],
+                        status=EngineStatus.ERROR,
+                        error_message="GitHub authentication rejected",
+                        latency_ms=latency,
+                        circuit_breaker_failure=False,
+                    )
                 if resp.status_code == 403:
                     return AdapterResponse(results=[], status=EngineStatus.BLOCKED, latency_ms=latency)
                 if resp.status_code == 422:
@@ -97,6 +130,58 @@ class GitHubAdapter(EngineAdapter):
                 error_message=str(exc),
                 latency_ms=latency,
             )
+
+    async def _check_provider_quota(self) -> AdapterResponse | None:
+        """Enforce the conservative GitHub search quota before egress."""
+
+        try:
+            rate = float(self.config.get("rate_limit", 0.15))
+        except (TypeError, ValueError):
+            rate = 0.15
+        if rate <= 0:
+            return AdapterResponse(
+                results=[],
+                status=EngineStatus.RATE_LIMITED,
+                error_message="GitHub provider quota disabled",
+                circuit_breaker_failure=False,
+            )
+
+        async with self._quota_lock:
+            now = time.monotonic()
+            if now < self._next_request_at:
+                return AdapterResponse(
+                    results=[],
+                    status=EngineStatus.RATE_LIMITED,
+                    error_message="GitHub provider quota guard",
+                    circuit_breaker_failure=False,
+                )
+            self._next_request_at = now + (1.0 / rate)
+        return None
+
+    async def _extend_provider_cooldown(self, headers: httpx.Headers) -> None:
+        """Honor GitHub's explicit retry window without sleeping a request."""
+
+        delays: list[float] = []
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            try:
+                delays.append(max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+
+        reset_at = headers.get("x-ratelimit-reset")
+        if reset_at:
+            try:
+                delays.append(max(0.0, float(reset_at) - time.time()))
+            except ValueError:
+                pass
+
+        if not delays:
+            return
+
+        async with self._quota_lock:
+            retry_at = time.monotonic() + max(delays)
+            self._next_request_at = max(self._next_request_at, retry_at)
 
     def _parse_items(self, items: list[dict[str, Any]], query: str, endpoint: str) -> list[SearchResult]:
         """Parse GitHub API search results into SearchResult list."""

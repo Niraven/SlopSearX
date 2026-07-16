@@ -110,6 +110,9 @@ class AdapterResponse:
     status: EngineStatus
     error_message: Optional[str] = None
     latency_ms: float = 0.0
+    # ``False`` marks local precondition failures that must not poison a
+    # provider-wide circuit. ``None`` lets the server infer from status.
+    circuit_breaker_failure: bool | None = None
     # SearXNG extended fields — populated by adapters that support them
     answers: list[dict[str, Any]] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)

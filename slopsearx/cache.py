@@ -1,6 +1,6 @@
 """Valkey-backed response cache.
 
-Cache key: search:{sha256(normalized_query + language + safesearch)}
+Cache key: search:{sha256(normalized query + complete search route)}
 Default TTL: 3600s for general queries, 300s for news. Graceful degradation:
 Valkey unavailable -> skip cache.
 """
@@ -36,19 +36,44 @@ def normalize_query(query: str) -> str:
     return norm.lower().strip()
 
 
-def cache_key(query: str, language: str = "en", safesearch: int = 0) -> str:
-    """Build deterministic cache key from normalized query tuple."""
-    norm_query = normalize_query(query)
-    norm = "{}|{}|{}".format(norm_query, language, safesearch)
-    digest = hashlib.sha256(norm.encode()).hexdigest()
+def cache_key(
+    query: str,
+    language: str = "en",
+    safesearch: int = 0,
+    *,
+    categories: list[str] | None = None,
+    engines: list[str] | None = None,
+    pageno: int = 1,
+    time_range: str = "",
+    response_format: str = "json",
+) -> str:
+    """Build a deterministic key for the complete result-producing route.
+
+    Category, engine, pagination, freshness, and wire-format scope must be part
+    of the key. Omitting any of them can return a valid response for the wrong
+    request, such as a cached science result for a GitHub-code query.
+    """
+
+    route = {
+        "schema": 2,
+        "categories": _normalized_scope(categories),
+        "engines": _normalized_scope(engines),
+        "format": response_format.strip().lower(),
+        "language": language.strip().lower(),
+        "pageno": pageno,
+        "query": normalize_query(query),
+        "safesearch": safesearch,
+        "time_range": time_range.strip().lower(),
+    }
+    encoded = json.dumps(route, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
     return "search:{}".format(digest)
 
 
-def _answer_cache_key(query: str) -> str:
-    """Build answer-level cache key from normalized query (no language/safesearch)."""
-    norm_query = normalize_query(query)
-    digest = hashlib.sha256(norm_query.encode()).hexdigest()
-    return "answer:{}".format(digest)
+def _normalized_scope(values: list[str] | None) -> list[str]:
+    """Return a stable, order-insensitive route scope."""
+
+    return sorted({value.strip().lower() for value in values or [] if value.strip()})
 
 
 def _ttl_for_query(categories: list[str] | None = None) -> int:
@@ -75,7 +100,6 @@ class SearchCache:
         self._connected = False
         self._default_ttl = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", "3600"))
         self._negative_ttl = int(os.environ.get("SEARCH_CACHE_NEGATIVE_TTL_SECONDS", "60"))
-        self._answer_ttl = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", "3600"))
 
     async def connect(self) -> None:
         """Establish async Valkey connection."""
@@ -147,35 +171,6 @@ class SearchCache:
             await self._client.setex(key, ttl, payload)
         except Exception as e:
             logger.debug("Cache set_error error: %s", e)
-
-    async def get_answer(self, query: str) -> dict[str, Any] | None:
-        """Retrieve answer-level cached response for a query.
-
-        Answer cache uses a broader key (query only, no language/
-        safesearch), so the same response is returned for any variant
-        of the same query string.
-
-        Args:
-            query: The raw search query string.
-
-        Returns:
-            Cached response dict, or ``None`` on miss / error.
-        """
-        key = _answer_cache_key(query)
-        return await self.get(key)
-
-    async def set_answer(self, query: str, value: dict[str, Any], ttl: int | None = None) -> None:
-        """Store a response in the answer-level cache.
-
-        Args:
-            query: The raw search query string.
-            value: The response dict to cache.
-            ttl: TTL in seconds. Falls back to ``self._answer_ttl``.
-        """
-        key = _answer_cache_key(query)
-        if ttl is None:
-            ttl = self._answer_ttl
-        await self.set(key, value, ttl)
 
     async def clear(self) -> None:
         """Clear all cached entries (admin/debug)."""

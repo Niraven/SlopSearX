@@ -57,6 +57,7 @@ class TestAdapterResponse:
         assert resp.results == []
         assert resp.error_message is None
         assert resp.latency_ms == 0.0
+        assert resp.circuit_breaker_failure is None
 
     def test_error_response(self) -> None:
         resp = AdapterResponse(
@@ -170,6 +171,30 @@ class TestEngineAdapter:
 
         inst = _CfgEngine({"api_key": "secret"})
         assert inst.config["api_key"] == "secret"
+
+    def test_circuit_half_open_probe_recovers_after_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        @register_engine
+        class _CircuitEngine(EngineAdapter):
+            name = "circuit-test"
+
+            async def search(self, query, params=None):
+                return AdapterResponse(results=[], status=EngineStatus.OK)
+
+        now = [100.0]
+        monkeypatch.setattr("slopsearx.adapter.time.time", lambda: now[0])
+        engine = _CircuitEngine()
+        engine._circuit_threshold = 1
+        engine._circuit_timeout = 30
+
+        engine.record_failure()
+        assert not engine.circuit_allowed()
+
+        now[0] = 131.0
+        assert engine.circuit_allowed()
+
+        engine.record_success()
+        assert engine.consecutive_errors == 0
+        assert engine.circuit_open_until == 0.0
 
 
 # ---------------------------------------------------------------------------
